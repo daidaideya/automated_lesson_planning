@@ -16,12 +16,12 @@ from docx.shared import Pt
 TARGET_KEYS = ["知识与技能", "过程与方法", "情感态度与价值观"]
 PROCESS_TITLE_KEYWORD = "教学过程设计"
 OBJECTIVE_LABELS = ["知识与技能目标：", "过程与方法目标：", "情感与价值目标："]
-PROCESS_SLOT_CAPACITIES = [38.0, 38.0]
-PROCESS_TITLE_CAPACITY_BONUS = 1.1
-PROCESS_FIELD_CAPACITY_BONUS = 0.3
-PROCESS_STEP_GAP_COST = 0.2
-PROCESS_WRAP_WIDTH = 48
-PROCESS_PARAGRAPH_LINE_SPACING = 0.95
+PROCESS_PAGE_ROW_CAPACITIES = [32.0, 32.0, 32.0, 34.0]
+PROCESS_TITLE_CAPACITY_BONUS = 0.9
+PROCESS_FIELD_CAPACITY_BONUS = 0.2
+PROCESS_STEP_GAP_COST = 0.08
+PROCESS_WRAP_WIDTH = 54
+PROCESS_PARAGRAPH_LINE_SPACING = 0.92
 PROCESS_FIRST_LINE_INDENT_CHARS = 0
 
 
@@ -305,7 +305,10 @@ def fill_first_table(document: Document, data: Dict[str, object]):
 def clone_table_after(document: Document, source_table, insert_after_element):
     new_tbl = deepcopy(source_table._tbl)
     insert_after_element.addnext(new_tbl)
-    return document.tables[-1]
+    for table in document.tables:
+        if table._tbl is new_tbl:
+            return table
+    raise RuntimeError("复制教学过程表格后未能定位新表格")
 
 
 def insert_page_break_after(element):
@@ -319,30 +322,80 @@ def insert_page_break_after(element):
     return paragraph
 
 
+def iter_body_elements(document: Document):
+    body = document._body._element
+    for child in body.iterchildren():
+        yield child
+
+
+def is_process_table(table) -> bool:
+    if not table.rows:
+        return False
+    header_text = table.cell(0, 0).text.replace(" ", "").replace("\n", "")
+    return PROCESS_TITLE_KEYWORD in header_text
+
+
 def get_process_tables(document: Document):
-    process_tables = []
-    for table in document.tables[1:]:
-        if not table.rows:
-            continue
-        header_text = table.cell(0, 0).text.replace(" ", "").replace("\n", "")
-        if PROCESS_TITLE_KEYWORD in header_text:
-            process_tables.append(table)
-    return process_tables
+    return [table for table in document.tables[1:] if is_process_table(table)]
 
 
-def get_process_content_cells(document) -> List[object]:
-    cells = []
-    for table in get_process_tables(document):
-        for row_index in range(1, len(table.rows)):
+def get_process_content_cells_from_tables(process_tables: List[object]) -> List[object]:
+    cells: List[object] = []
+    for table in process_tables:
+        for row_index in range(1, len(table.rows), 2):
             if len(table.rows[row_index].cells) == 0:
                 continue
             cells.append(table.cell(row_index, 0))
     return cells
 
 
-def append_process_table_page(document: Document, template_table):
-    page_break = insert_page_break_after(document._body._element[-1])
-    return clone_table_after(document, template_table, page_break)
+def get_process_content_cells(document) -> List[object]:
+    return get_process_content_cells_from_tables(get_process_tables(document))
+
+
+def append_process_page_table(document: Document, template_table, insert_after_element) -> object:
+    return clone_table_after(document, template_table, insert_after_element)
+
+
+def remove_body_element(element):
+    parent = element.getparent()
+    if parent is not None:
+        parent.remove(element)
+
+
+def remove_table_with_adjacent_break(table):
+    previous = table._tbl.getprevious()
+    remove_body_element(table._tbl)
+    if previous is not None and previous.tag.endswith('}p'):
+        if ''.join(previous.itertext()).strip() == '':
+            has_page_break = any(
+                node.get(qn('w:type')) == 'page'
+                for node in previous.iter(qn('w:br'))
+            )
+            if has_page_break:
+                remove_body_element(previous)
+
+
+def remove_trailing_empty_paragraphs(document: Document):
+    while True:
+        body = document._body._element
+        if len(body) == 0:
+            return
+        last = body[-1]
+        if not last.tag.endswith('}p'):
+            return
+        text_content = ''.join(last.itertext()).strip()
+        has_page_break = any(node.get(qn('w:type')) == 'page' for node in last.iter(qn('w:br')))
+        if text_content or not has_page_break:
+            return
+        remove_body_element(last)
+
+
+def trim_empty_process_tables(document: Document, required_table_count: int):
+    process_tables = get_process_tables(document)
+    for table in reversed(process_tables[required_table_count:]):
+        remove_table_with_adjacent_break(table)
+    remove_trailing_empty_paragraphs(document)
 
 
 def measure_text_units(text: str, wrap_width: int = PROCESS_WRAP_WIDTH) -> float:
@@ -477,68 +530,105 @@ def split_block_for_capacity(block: List[Dict[str, object]], capacity: float) ->
     return pieces
 
 
-def paginate_process_blocks(blocks: List[List[Dict[str, object]]], slot_capacities: List[float]) -> List[List[Dict[str, object]]]:
-    pages: List[List[Dict[str, object]]] = []
-    current_page: List[Dict[str, object]] = []
+def paginate_process_blocks(blocks: List[List[Dict[str, object]]], row_capacities: List[float] | None = None) -> List[List[Dict[str, object]]]:
+    capacities = row_capacities or PROCESS_PAGE_ROW_CAPACITIES
+    rows: List[List[Dict[str, object]]] = []
+    current_row: List[Dict[str, object]] = []
     current_usage = 0.0
-    slot_index = 0
+    row_index = 0
 
     def capacity_for(index: int) -> float:
-        if index < len(slot_capacities):
-            return slot_capacities[index]
-        return PROCESS_SLOT_CAPACITIES[index % len(PROCESS_SLOT_CAPACITIES)]
+        if index < len(capacities):
+            return capacities[index]
+        return PROCESS_PAGE_ROW_CAPACITIES[index % len(PROCESS_PAGE_ROW_CAPACITIES)]
 
     for block in blocks:
         pending_blocks = [block]
         while pending_blocks:
             current_block = pending_blocks.pop(0)
-            capacity = capacity_for(slot_index)
+            capacity = capacity_for(row_index)
             block_usage = estimate_process_line_usage(current_block)
-            extra_gap = PROCESS_STEP_GAP_COST if current_page else 0.0
+            extra_gap = PROCESS_STEP_GAP_COST if current_row else 0.0
 
-            if current_page and current_usage + extra_gap + block_usage <= capacity:
+            if current_row and current_usage + extra_gap + block_usage <= capacity:
                 current_usage += extra_gap
-                current_page.extend(current_block)
+                current_row.extend(current_block)
                 continue
 
-            if not current_page and block_usage <= capacity:
-                current_page.extend(current_block)
+            if not current_row and block_usage <= capacity:
+                current_row.extend(current_block)
                 current_usage = block_usage
                 continue
 
-            if not current_page:
+            if not current_row:
                 split_blocks = split_block_for_capacity(current_block, capacity)
                 head = split_blocks[0]
                 tail = split_blocks[1:]
-                current_page.extend(head)
+                current_row.extend(head)
                 current_usage = estimate_process_line_usage(head)
-                pending_blocks = tail + pending_blocks
-            else:
-                pages.append(current_page)
-                current_page = []
+                rows.append(current_row)
+                current_row = []
                 current_usage = 0.0
-                slot_index += 1
-                pending_blocks.insert(0, current_block)
+                row_index += 1
+                pending_blocks = tail + pending_blocks
                 continue
 
-            if current_page:
-                pages.append(current_page)
-                current_page = []
-                current_usage = 0.0
-                slot_index += 1
+            rows.append(current_row)
+            current_row = []
+            current_usage = 0.0
+            row_index += 1
+            pending_blocks.insert(0, current_block)
 
-    if current_page or not pages:
-        pages.append(current_page)
+    if current_row or not rows:
+        rows.append(current_row)
 
-    return pages
+    return rows
 
 
 def clear_cell(cell):
-    cell.text = ""
-    paragraph = cell.paragraphs[0]
-    paragraph.clear()
-    configure_paragraph_format(paragraph)
-    return paragraph
+    tc = cell._tc
+    for child in list(tc):
+        tc.remove(child)
+    paragraph = OxmlElement("w:p")
+    tc.append(paragraph)
+    clean_paragraph = cell.paragraphs[0]
+    configure_paragraph_format(clean_paragraph)
+    return clean_paragraph
+
+
+def split_block_to_fit_cell(block: List[Dict[str, object]], capacity: float = 32.0) -> tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    if not block:
+        return [], []
+    pieces = split_block_for_capacity(block, capacity)
+    if not pieces:
+        return [], []
+    head = pieces[0]
+    tail: List[Dict[str, object]] = []
+    for piece in pieces[1:]:
+        tail.extend(piece)
+    return head, tail
+
+
+def paginate_process_into_cells(blocks: List[List[Dict[str, object]]], cell_count: int, capacity: float = 32.0) -> List[List[Dict[str, object]]]:
+    cells: List[List[Dict[str, object]]] = []
+    pending_blocks = [list(block) for block in blocks if block]
+
+    while pending_blocks and (cell_count <= 0 or len(cells) < cell_count):
+        block = pending_blocks.pop(0)
+        usage = estimate_process_line_usage(block)
+        if usage <= capacity:
+            cells.append(block)
+            continue
+
+        head, tail = split_block_to_fit_cell(block, capacity)
+        cells.append(head)
+        if tail:
+            pending_blocks.insert(0, tail)
+
+    while cell_count > 0 and len(cells) < cell_count:
+        cells.append([])
+
+    return cells
 
 
 def write_process_lines_to_cell(cell, lines: List[Dict[str, object]]):
@@ -554,7 +644,7 @@ def write_process_lines_to_cell(cell, lines: List[Dict[str, object]]):
             alignment=WD_ALIGN_PARAGRAPH.LEFT,
             line_spacing=PROCESS_PARAGRAPH_LINE_SPACING,
             first_line_indent_chars=0 if is_title or kind == "field_label" else PROCESS_FIRST_LINE_INDENT_CHARS,
-            keep_with_next=kind in {"step_title", "field_label"},
+            keep_with_next=kind == "field_label",
         )
         run = paragraph.add_run(str(line.get("text", "")))
         set_run_font(run, font_name="宋体", font_size=10.5, bold=bool(line.get("bold", False)))
@@ -567,28 +657,35 @@ def fill_process_content(document: Document, data: Dict[str, object], template_p
         return
 
     blocks = build_process_blocks(sections)
-    if not blocks:
-        content_cells = get_process_content_cells(document)
-        for cell in content_cells:
-            clear_cell(cell)
+    template_cells = get_process_content_cells_from_tables(process_tables)
+    if not template_cells:
         return
 
-    template_table = process_tables[0]
-    initial_slot_count = len(process_tables) * len(PROCESS_SLOT_CAPACITIES)
-    slot_capacities = [
-        PROCESS_SLOT_CAPACITIES[index % len(PROCESS_SLOT_CAPACITIES)]
-        for index in range(initial_slot_count)
-    ]
-    pages = paginate_process_blocks(blocks, slot_capacities)
-    required_pages = max(1, (len(pages) + len(PROCESS_SLOT_CAPACITIES) - 1) // len(PROCESS_SLOT_CAPACITIES))
+    cell_rows = paginate_process_into_cells(blocks, 0) if blocks else []
+    cells_per_full_table = max(1, len(get_process_content_cells_from_tables(process_tables[:1])))
+    remaining_cells_after_first = max(0, len(template_cells) - cells_per_full_table)
+    extra_cell_count = max(0, len(cell_rows) - len(template_cells))
+    extra_table_count = (extra_cell_count + remaining_cells_after_first - 1) // remaining_cells_after_first if remaining_cells_after_first else 0
+    required_table_count = min(len(process_tables), 1 + extra_table_count)
 
-    while len(process_tables) < required_pages:
-        process_tables.append(append_process_table_page(document, template_table))
+    while len(process_tables) < required_table_count:
+        insert_after = process_tables[-1]._tbl if process_tables else document.tables[0]._tbl
+        append_process_page_table(document, process_tables[-1], insert_after)
+        process_tables = get_process_tables(document)
 
-    content_cells = get_process_content_cells(document)
+    trim_empty_process_tables(document, required_table_count)
+    process_tables = get_process_tables(document)
+
+    content_cells = get_process_content_cells_from_tables(process_tables)
+    cell_rows = paginate_process_into_cells(blocks, len(content_cells)) if blocks else [[] for _ in content_cells]
     for index, cell in enumerate(content_cells):
-        page_lines = pages[index] if index < len(pages) else []
-        write_process_lines_to_cell(cell, page_lines)
+        row_lines = cell_rows[index] if index < len(cell_rows) else []
+        write_process_lines_to_cell(cell, row_lines)
+
+    for cell in content_cells[len(cell_rows):]:
+        clear_cell(cell)
+
+    remove_trailing_empty_paragraphs(document)
 
 
 def build_doc(data: Dict[str, object], template_path: Path, output_path: Path):
